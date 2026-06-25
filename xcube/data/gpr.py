@@ -89,4 +89,12 @@ class GPRDataset(RandomSafeDataset):
         if DS.INPUT_INTENSITY in self.spec:
             data[DS.INPUT_INTENSITY] = input_data['input_prob']
 
+        # Stage 2 (diffusion) needs both grids at once: the GT shape (as INPUT_PC,
+        # via input_key="target_grid" in the diffusion config) to learn/denoise, and
+        # TEUNet's flawed grid as a separate conditioning hint -- always from
+        # 'input_grid' regardless of self.input_key, since that's specifically
+        # TEUNet's reconstruction in the saved .pkl.
+        if DS.COND_PC in self.spec:
+            data[DS.COND_PC] = input_data['input_grid']
+
         return data

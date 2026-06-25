@@ -45,6 +45,10 @@ class DatasetSpec(Enum):
     TEXT_EMBEDDING_MASK = 1610
     TEXT = 1620
     MICRO = 1630
+    # New slot for a second, separate conditioning grid (e.g. GPR's TEUNet
+    # reconstruction), distinct from INPUT_PC which diffusion.py always treats
+    # as "the main shape being learned/denoised".
+    COND_PC = 1640
 
 class RandomSafeDataset(Dataset):
     """

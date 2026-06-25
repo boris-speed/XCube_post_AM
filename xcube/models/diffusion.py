@@ -156,6 +156,11 @@ class Model(BaseModel):
             self.hparams.use_single_scan_concat_cond = False
         if not hasattr(self.hparams, 'encode_single_scan_by_points'):
             self.hparams.encode_single_scan_by_points = False
+        # GPR Stage 2: condition on a second sparse grid (e.g. TEUNet's flawed
+        # reconstruction) by encoding it through the same frozen VAE encoder used
+        # for the main latent, then concatenating it onto the noisy latent.
+        if not hasattr(self.hparams, 'use_cond_grid_concat_cond'):
+            self.hparams.use_cond_grid_concat_cond = False
             
         if not hasattr(self.hparams, 'use_class_cond'):
             self.hparams.use_class_cond = False
@@ -261,7 +266,21 @@ class Model(BaseModel):
         net_module = importlib.import_module("xcube.models." + model_args.model).Model
         args_ckpt = Path(self.hparams.vae_checkpoint)
         assert args_ckpt.exists(), "Selected VAE checkpoint does not exist!"
-        return net_module.load_from_checkpoint(args_ckpt, hparams=model_args)
+        # Original: return net_module.load_from_checkpoint(args_ckpt, hparams=model_args)
+        # torch>=2.6 made torch.load default to weights_only=True, which now blocks
+        # unpickling the OmegaConf settings object saved inside our own checkpoint's
+        # hparams. This pytorch-lightning version (1.9.4) predates that change and has
+        # no way to pass weights_only through, so temporarily relax just this one call --
+        # safe here since it's our own locally-trained checkpoint, not a downloaded one.
+        _original_torch_load = torch.load
+        def _torch_load_trusted(*args, **kwargs):
+            kwargs.setdefault('weights_only', False)
+            return _original_torch_load(*args, **kwargs)
+        torch.load = _torch_load_trusted
+        try:
+            return net_module.load_from_checkpoint(args_ckpt, hparams=model_args)
+        finally:
+            torch.load = _original_torch_load
 
     @rank_zero_only
     @torch.no_grad()
@@ -413,8 +432,26 @@ class Model(BaseModel):
                 concat_normal = cond_dict['normal']
             concat_normal.jdata /= (concat_normal.jdata.norm(dim=1, keepdim=True) + 1e-6) # avoid nan
             if not is_testing and self.hparams.use_classifier_free:
-                concat_normal = self.conduct_classifier_free(concat_normal, noisy_latents.grid.grid_count, noisy_latents.grid.device)            
+                concat_normal = self.conduct_classifier_free(concat_normal, noisy_latents.grid.grid_count, noisy_latents.grid.device)
             concat_list.append(concat_normal)
+        if self.hparams.use_cond_grid_concat_cond:
+            # GPR Stage 2: encode the second grid (TEUNet's flawed reconstruction,
+            # batch[DS.COND_PC]) through the frozen Stage 1 VAE's own encoder -- the
+            # same one used to build the main latent -- so the hint lives in the same
+            # latent space as what we're denoising. use_mode=True means "use the VAE's
+            # mean prediction, not a random sample", since we want a stable, repeatable
+            # hint rather than fresh VAE sampling noise on top of the diffusion noise.
+            if batch is not None:
+                cond_latent = self.vae._encode({DS.INPUT_PC: batch[DS.COND_PC]}, use_mode=True)
+            else:
+                cond_latent = cond_dict['cond_grid_latent']
+            # TEUNet's grid generally occupies different voxels than the GT grid we're
+            # denoising, so align the encoded hint onto noisy_latents' own sparse grid
+            # before concatenating (same alignment trick used for single_scan_cond above).
+            cond_grid_cond = noisy_latents.grid.fill_to_grid(cond_latent.feature, cond_latent.grid, 0.0)
+            if not is_testing and self.hparams.use_classifier_free:
+                cond_grid_cond = self.conduct_classifier_free(cond_grid_cond, noisy_latents.grid.grid_count, noisy_latents.grid.device)
+            concat_list.append(cond_grid_cond)
 
         if do_classifier_free_guidance and len(concat_list) > 0: # ! not tested yet
             if not self.hparams.use_classifier_free:
@@ -538,6 +575,11 @@ class Model(BaseModel):
 
         out.update({'pred': model_pred.feature.jdata})
         out.update({'target': target})
+        # Passed to self.log/log_dict_prefix in train_val_step below: without an explicit
+        # batch_size, Lightning tries to auto-infer it from the batch dict, which fails for
+        # GPR since its batch only contains custom fvdb GridBatch/JaggedTensor objects
+        # (same issue fixed in autoencoder.py for Stage 1).
+        out.update({'log_batch_size': bsz})
 
         return out
     
@@ -610,11 +652,17 @@ class Model(BaseModel):
         with exp.pt_profile_named("loss"):
             loss_dict, metric_dict = self.compute_loss(batch, out, compute_metric=is_val)
 
+        # batch_size passed explicitly below (same fix as autoencoder.py for Stage 1):
+        # GPR's batch only has custom fvdb objects, so Lightning can't auto-infer batch_size.
+        log_batch_size = out['log_batch_size']
         if not is_val:
-            self.log_dict_prefix('train_loss', loss_dict)
+            # Original: self.log_dict_prefix('train_loss', loss_dict)
+            self.log_dict_prefix('train_loss', loss_dict, batch_size=log_batch_size)
         else:
-            self.log_dict_prefix('val_metric', metric_dict)
-            self.log_dict_prefix('val_loss', loss_dict)
+            # Original: self.log_dict_prefix('val_metric', metric_dict)
+            self.log_dict_prefix('val_metric', metric_dict, batch_size=log_batch_size)
+            # Original: self.log_dict_prefix('val_loss', loss_dict)
+            self.log_dict_prefix('val_loss', loss_dict, batch_size=log_batch_size)
             if self.hparams.log_image:
                 cond_dict = {}
                 if self.hparams.use_single_scan_concat_cond:
@@ -648,8 +696,10 @@ class Model(BaseModel):
                         _ = self.random_sample_latents(grids, use_ddim=self.hparams.use_ddim, ddim_step=100, cond_dict=cond_dict) # TODO: change this ddim_step to variable
 
         loss_sum = loss_dict.get_sum()
-        self.log('val_loss' if is_val else 'train_loss/sum', loss_sum)
-        self.log('val_step', self.global_step)
+        # Original: self.log('val_loss' if is_val else 'train_loss/sum', loss_sum)
+        self.log('val_loss' if is_val else 'train_loss/sum', loss_sum, batch_size=log_batch_size)
+        # Original: self.log('val_step', self.global_step)
+        self.log('val_step', self.global_step, batch_size=log_batch_size)
 
         return loss_sum
     
@@ -724,8 +774,15 @@ class Model(BaseModel):
                 concat_normal.jdata /= (concat_normal.jdata.norm(dim=1, keepdim=True) + 1e-6) # avoid nan
             else:
                 raise NotImplementedError("No normal provided")
-            cond_dict['normal'] = concat_normal                
-        
+            cond_dict['normal'] = concat_normal
+        if self.hparams.use_cond_grid_concat_cond:
+            # Real Stage 2 use: no GT exists yet, so the condition must come from a
+            # real TEUNet grid passed in via `batch`, not from a previous stage's result.
+            if batch is not None:
+                cond_dict['cond_grid_latent'] = self.vae._encode({DS.INPUT_PC: batch[DS.COND_PC]}, use_mode=True)
+            else:
+                raise NotImplementedError("use_cond_grid_concat_cond needs a real TEUNet grid passed via `batch`")
+
         # diffusion process
         if use_ema:
             with self.ema_scope("Evaluation API"):
@@ -810,6 +867,8 @@ class Model(BaseModel):
             all_specs.append(DS.TEXT_EMBEDDING_MASK)
         if self.hparams.use_micro_cond:
             all_specs.append(DS.MICRO)
+        if self.hparams.use_cond_grid_concat_cond:
+            all_specs.append(DS.COND_PC)
         return all_specs
     
     def get_collate_fn(self):
