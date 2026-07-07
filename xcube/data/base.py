@@ -49,6 +49,9 @@ class DatasetSpec(Enum):
     # reconstruction), distinct from INPUT_PC which diffusion.py always treats
     # as "the main shape being learned/denoised".
     COND_PC = 1640
+    # Per-sample training loss weight (e.g. GPR's hardness-based reweighting,
+    # see xcube/data/gpr.py) -- a plain float, collated into a (batch,) tensor.
+    LOSS_WEIGHT = 1650
 
 class RandomSafeDataset(Dataset):
     """

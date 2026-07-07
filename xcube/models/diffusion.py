@@ -173,6 +173,12 @@ class Model(BaseModel):
             self.hparams.train_cond_footprint = False
         if not hasattr(self.hparams, 'cond_grid_dilation_kernel'):
             self.hparams.cond_grid_dilation_kernel = 1
+        # Hardness-reweighting (see PROGRESS.md): scales the MSE loss per-sample by
+        # xcube/data/gpr.py's DS.LOSS_WEIGHT (1.0 for a perfect TEUNet match, higher
+        # the more TEUNet diverges from GT). Off by default -- matches v1-v4 exactly
+        # when False, since the plain mean MSE is unchanged.
+        if not hasattr(self.hparams, 'use_hardness_reweight'):
+            self.hparams.use_hardness_reweight = False
 
         if not hasattr(self.hparams, 'use_class_cond'):
             self.hparams.use_class_cond = False
@@ -624,6 +630,13 @@ class Model(BaseModel):
         # (same issue fixed in autoencoder.py for Stage 1).
         out.update({'log_batch_size': bsz})
 
+        # Hardness-reweighting: per-voxel batch index (to map each of the N voxels
+        # back to which of the bsz samples it came from) plus that sample's weight
+        # from xcube/data/gpr.py's DS.LOSS_WEIGHT, both needed in compute_loss.
+        if self.hparams.use_hardness_reweight:
+            out.update({'jidx': latents.feature.jidx.long()})
+            out.update({'sample_weight': batch[DS.LOSS_WEIGHT].to(latent_data.device).float()})
+
         return out
     
     def get_random_sample_pcs(self, ijk: fvdb.JaggedTensor, batch_size=1, M=3, use_center=False):
@@ -673,7 +686,16 @@ class Model(BaseModel):
 
         # compute the MSE loss
         if self.hparams.supervision.mse_weight > 0.0:
-            loss_dict.add_loss("mse", F.mse_loss(out["pred"], out["target"]), self.hparams.supervision.mse_weight)
+            if self.hparams.use_hardness_reweight:
+                # Per-voxel squared error -> per-voxel weight (looked up from that
+                # voxel's sample via jidx) -> weighted mean, instead of a flat mean
+                # that lets the ~64% "good"-tier majority dominate the gradient.
+                per_voxel_se = F.mse_loss(out["pred"], out["target"], reduction='none').mean(dim=1)
+                voxel_weight = out['sample_weight'][out['jidx']]
+                mse = (per_voxel_se * voxel_weight).sum() / voxel_weight.sum()
+            else:
+                mse = F.mse_loss(out["pred"], out["target"])
+            loss_dict.add_loss("mse", mse, self.hparams.supervision.mse_weight)
         if compute_metric: # currently use MSE as metric
             metric_dict.add_loss("mse", F.mse_loss(out["pred"], out["target"]))
 

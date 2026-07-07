@@ -37,7 +37,8 @@ class GPRDataset(RandomSafeDataset):
 
     def __init__(self, base_path, split, resolution, spec=None,
                  random_seed=0, hparams=None, skip_on_error=False,
-                 custom_name="gpr", duplicate_num=1, input_key="input_grid", **kwargs):
+                 custom_name="gpr", duplicate_num=1, input_key="input_grid",
+                 hardness_scale=0.0, **kwargs):
         if isinstance(random_seed, str):
             super().__init__(0, True, skip_on_error)
         else:
@@ -51,6 +52,14 @@ class GPRDataset(RandomSafeDataset):
         # self-reconstructs GT shapes. Stage 2 (diffusion) uses the default
         # "input_grid" since TEUNet's output becomes a conditioning signal instead.
         self.input_key = input_key
+        # Hardness-reweighting (see PROGRESS.md): 0.0 disables it (default, matches
+        # v1-v4 behavior exactly). When > 0, _get_item computes a per-sample loss
+        # weight from how little TEUNet's grid overlaps GT's -- samples where TEUNet
+        # is very wrong (the ~13% "poor" tier) get up-weighted, since with equal
+        # per-sample weighting the ~64% "good" tier (where blind copy-through is
+        # already near-optimal) dominates the average loss and gives the model
+        # little incentive to learn real correction behavior.
+        self.hardness_scale = hardness_scale
 
         split_file = os.path.join(base_path, (split + '.lst'))
         with open(split_file, 'r') as f:
@@ -96,5 +105,11 @@ class GPRDataset(RandomSafeDataset):
         # TEUNet's reconstruction in the saved .pkl.
         if DS.COND_PC in self.spec:
             data[DS.COND_PC] = input_data['input_grid']
+
+        if self.hardness_scale > 0:
+            teunet_ijk = set(map(tuple, input_data['input_grid'].ijk[0].jdata.cpu().numpy().tolist()))
+            gt_ijk = set(map(tuple, input_data['target_grid'].ijk[0].jdata.cpu().numpy().tolist()))
+            iou = len(teunet_ijk & gt_ijk) / (len(teunet_ijk | gt_ijk) + 1e-6)
+            data[DS.LOSS_WEIGHT] = 1.0 + self.hardness_scale * (1.0 - iou)
 
         return data

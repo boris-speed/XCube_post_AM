@@ -2,21 +2,29 @@ include_configs:
   - ../train/diffusion/diffusion_128x128x128_sparse.yaml
   - gpr.yaml
 
-name: 'gpr/Diffusion_stage2_v4'
+name: 'gpr/Diffusion_stage2_v5'
 
-# --- Stage 2 v4 (this config): tests the "network is too small" theory. v1/v2/v3
-# all changed *how the model was trained* (footprint, dilation, classifier-free
-# dropout) and landed within noise of each other (~0.65-0.66 overall IoU, just
-# under TEUNet's own 0.665 baseline). None of those changed the model's actual
-# capacity. This config isolates capacity as the only new variable: same plain
-# GT footprint as v1, no classifier-free dropout, no attention -- just a bigger
-# network (more channels, one more depth level, more res blocks per level).
+# --- Stage 2 v5 (this config): tests the "loss reweighting" theory. v1-v4 all
+# weighted every training sample equally, so the ~64% "good" tier (where blind
+# copy-through of TEUNet's hint is already near-optimal) dominates the average
+# loss and gives the model little incentive to learn real correction behavior
+# on the ~13% "poor" tier where correction actually matters. This config keeps
+# v1's architecture and plain GT footprint exactly as-is (capacity and
+# structural-confinement fixes were both already ruled out) and changes only
+# one thing: up-weight each training sample's loss contribution by how much
+# TEUNet's grid diverges from GT (xcube/data/gpr.py's hardness_scale, wired
+# through diffusion.py's use_hardness_reweight).
 train_kwargs:
   input_key: "target_grid"
+  hardness_scale: 3.0
 val_kwargs:
   input_key: "target_grid"
+  hardness_scale: 3.0
 test_kwargs:
   input_key: "target_grid"
+  hardness_scale: 3.0
+
+use_hardness_reweight: true
 
 resolution: "0.005"
 
@@ -52,20 +60,19 @@ learning_rate:
 weight_decay: 0.0
 grad_clip: 0.5
 
-# --- Increased capacity vs v1/v2/v3: model_channels 32->64, one more depth
-# level (channel_mult [1,2]->[1,2,4]), num_res_blocks 1->2. Still no attention,
-# to keep this a pure capacity test rather than also changing the conditioning
-# mechanism (that's the separate cross-attention experiment, not this one).
+# --- Same architecture as v1: capacity was already ruled out (v4-capacity
+# landed below v1-v3's ceiling), so this isolates reweighting as the only
+# new variable. ---
 network:
   diffuser_name: "UNetModel_Sparse"
   diffuser:
     dims: 3
     image_size: [32, 32, 24]
-    model_channels: 64
+    model_channels: 32
     use_middle_attention: false
-    channel_mult: [1, 2, 4]
+    channel_mult: [1, 2]
     attention_resolutions: []
-    num_res_blocks: 2
+    num_res_blocks: 1
     num_heads: 4
   scheduler:
     num_train_timesteps: ${num_train_timesteps}
@@ -76,7 +83,5 @@ network:
     clip_sample: False
     prediction_type: ${prediction_type}
 
-# Bumped back to match v1-v3's batch_size (smoke-tested clean on the RTX 2000
-# Ada, 16GB) -- keeps the optimization dynamics comparable across versions.
 batch_size: 2
 train_val_num_workers: 4

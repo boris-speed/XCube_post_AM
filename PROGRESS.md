@@ -287,39 +287,171 @@ no attention) has a real ceiling around 0.65-0.66 overall IoU — just shy of
 TEUNet's own baseline — regardless of these three training-time
 interventions.
 
-**Not yet tried, would need a genuinely different angle rather than another
-training-time tweak**:
-- Increase network capacity (more channels/res blocks/attention) — current
-  network is deliberately tiny (scaled down from XCube's Waymo-scale
-  defaults); it's possible it's simply too small to learn anything beyond
-  near-copy-through, independent of training regime.
-- Reconsider whether per-voxel IoU vs. TEUNet is even the right comparison —
-  TEUNet's own reconstruction is itself a strong, already-trained baseline;
-  beating it on the same input information may require the diffusion model
-  to access something TEUNet doesn't (e.g. the raw GPR scan itself, not just
-  TEUNet's already-collapsed binary/probability grid).
-- Try a fundamentally different conditioning mechanism (e.g. cross-attention
-  instead of channel-concat) rather than another concat-based variant.
+**Fix attempt 4 (tried 2026-06-30): free structural generation at inference
+— catastrophic failure, IoU ≈ 0.** Implemented in
+`scripts/run_stage2_inference_v4.py` (uses the v1 checkpoint, no
+retraining). Instead of encoding TEUNet's grid and passing its topology as
+`grids`, manually constructs a fully-dense coarse grid matching the VAE's
+bottom level (`feat_depth = tree_depth-1 = 1`, `gap_stride = 2`,
+`voxel_bound = [32, 32, 24]`, `voxel_sizes = voxel_size * gap_stride`,
+`origins = voxel_sizes / 2`) and passes that as `grids`, while still passing
+TEUNet's grid as a conditioning hint via `batch={DS.COND_PC: teunet_grid}`.
+Full 198-sample eval (`scripts/results/stage2_full_test_v4_198samples.txt`):
 
-(Separately, also worth trying: `use_classifier_free` is currently `false` in
-the config — enabling it randomly hides the conditioning signal during
-training ~10% of the time, which could counter a possible "shortcut" effect
-from concatenating TEUNet's hint very strongly at every denoising step. Not
-mutually exclusive with the structural-confinement fixes above.)
+| Tier | n | v4 IoU vs GT | TEUNet IoU vs GT | Diff |
+|---|---|---|---|---|
+| Good | 126 | 0.004 | 0.816 | −0.811 |
+| Moderate | 46 | 0.002 | 0.580 | −0.578 |
+| Poor | 26 | 0.009 | 0.085 | −0.077 |
+| **Overall** | **198** | **0.004** | **0.665** | **−0.661** |
 
-## Visualization (`scripts/visualize_stage2_sample.py`)
+The model filled the entire domain with a solid block (~165k voxels)
+regardless of sample — visible in `~/Documents/stage2_visual_comparison_multi_v4.png`.
+Root cause: the decoder was only ever trained to subdivide GT-shaped sparse
+grids; given a fully-dense starting grid it has no learned behavior for
+pruning and activates every voxel. This definitively rules out structural
+confinement as the fixable bottleneck — the model had full freedom and
+performed catastrophically worse, not better.
 
-Side-by-side 3D **voxel-cube** rendering (TEUNet input / model output / ground
-truth) for any chosen test sample, saved to `stage2_visual_comparison.png`.
-Originally used scattered dots (`ax.scatter`), which made even the ground
-truth look like noise; switched to matplotlib's `ax.voxels()` to draw actual
-filled cubes per occupied cell, with a shared bounding box/scale and a fixed
-camera angle — now clearly shows real pipe shapes.
+## Poor-Tier Visual Audit (2026-07-02)
 
-## Status as of today (2026-06-25)
+All 26 poor-tier test samples (indices 172–197) rendered side-by-side
+(TEUNet input / v1 model output / ground truth) in four batches saved to
+`~/Documents/poor_batch{1-4}_*.png`. Four distinct failure patterns
+identified:
 
-Stage 1 and Stage 2 both trained. Real inference and a full 198-sample
-evaluation confirmed Stage 2 does **not** yet beat the TEUNet baseline, and
-the VAE round-trip diagnostic + structural-confinement theory above explains
-why. Not yet done: trying either candidate fix (test-time dilation, or
-retraining with TEUNet's footprint included), and re-evaluating afterward.
+**Pattern A — Complete spatial miss (IoU = 0.000): 10 of 26 samples (38%)**
+TEUNet places voxels in entirely the wrong physical location or finds
+near-nothing. Model output stays at 0.000 — no correction is possible
+because the conditioning signal carries zero spatial information about the
+pipe's actual location. Includes cases (#176, #177, #183, #191) where
+TEUNet outputs a thick rectangular slab in a small corner of the domain
+while GT has two large parallel cylinders spanning the full length.
+
+**Pattern B — Over-segmentation / wrong shape (IoU ≈ 0.05): 4 of 26 (15%)**
+TEUNet finds a large amorphous blob roughly where the pipe is but produces
+the wrong shape entirely (flat slab instead of cylinder). Model copies this
+with marginal voxel count changes and no structural correction.
+
+**Pattern C — Fragmentation (IoU = 0.10–0.30): 4 of 26 (15%)**
+TEUNet finds voxels in the right region but they are scattered and
+disconnected. **The only category where the model shows any meaningful
+improvement**: #175 (0.242→0.295), #185 (0.241→0.296). Slight
+consolidation of the fragmented signal occurs, but never a full clean
+tube reconstruction.
+
+**Pattern D — Complex geometry (IoU = 0.08–0.29): 8 of 26 (31%)**
+GT contains multi-pipe arrangements, L/T junctions, or curved paths.
+TEUNet partially captures these but gets the topology wrong. Model output
+is near-identical to TEUNet (±0.01 IoU). Best cases in the entire poor
+tier (#187 at 0.301, #192 at 0.278) fall here — TEUNet was close but
+noise prevented it crossing the 0.3 threshold.
+
+**Key finding**: Pattern A (38%) is entirely out of reach for any model
+that conditions only on TEUNet's output — there is no information in the
+conditioning signal about where the pipe is. Patterns B and D suggest the
+bottleneck is shape/topology learning capacity. Only Pattern C shows the
+model can do anything useful. Accessing pre-TEUNet signal (raw GPR scan or
+intermediate representation) is the only realistic path to fixing Pattern A.
+
+## Visualization scripts
+
+| Script | Purpose |
+|---|---|
+| `scripts/visualize_stage2_sample.py` | Single sample: TEUNet / v1 output / GT |
+| `scripts/visualize_stage2_multi.py` | Multi-sample batch: TEUNet / v1 output / GT |
+| `scripts/visualize_stage2_multi_v4.py` | Same but uses free-gen coarse grid (fix 4) |
+
+All use matplotlib `ax.voxels()` for filled-cube rendering with a shared
+bounding box from GT and a fixed camera angle (elev=20, azim=-60).
+
+## Capacity test (tried 2026-07-03): bigger network, still no improvement
+
+Tested the "network is too small" theory from the earlier "not yet tried"
+list: `configs/gpr/gpr_diffusion_v4.yaml` keeps v1's plain GT footprint (no
+dilation, no classifier-free dropout, no attention) but quadruples rough
+capacity — `model_channels` 32→64, one more depth level (`channel_mult`
+[1,2]→[1,2,4]), `num_res_blocks` 1→2. Trained 50 epochs (`batch_size: 2`,
+~19hr on the RTX 2000 Ada). Full 198-sample eval
+(`scripts/results/stage2_full_test_v4capacity_198samples.txt`):
+
+| Tier | n | v4-capacity IoU vs GT | TEUNet IoU vs GT | Diff |
+|---|---|---|---|---|
+| Good | 126 | 0.780 | 0.816 | −0.036 |
+| Moderate | 46 | 0.527 | 0.580 | −0.053 |
+| Poor | 26 | 0.089 | 0.085 | +0.003 |
+| **Overall** | **198** | **0.630** | **0.665** | **−0.035** |
+
+Not only did more capacity fail to beat TEUNet's baseline, it landed
+*below* the ~0.65-0.66 overall IoU that all three training-regime variants
+(v1/v2/v3) converged to — network size was not the bottleneck. Combined
+with the audit's finding that 38% of poor-tier failures are complete
+spatial misses with zero recoverable signal in TEUNet's output, this
+closes out the architectural/training-regime angle entirely.
+
+## Post-processing test (tried 2026-07-03): morphological closing on model output
+
+Cheap, no-retraining check: does bridging small gaps (morphological closing,
+`scipy.ndimage.binary_closing`, 1-2 iterations) on the v1 model's *output*
+voxels recover any IoU, especially on poor-tier fragmented samples?
+`scripts/test_postprocess_closing.py`, full 198-sample run
+(`scripts/results/postprocess_closing_198samples.txt`): **essentially zero
+change everywhere** (good +0.000, moderate -0.000, poor +0.000 to +0.001).
+The model's fragmented outputs aren't "almost right, just needs bridging" —
+confirms the gaps are too large/structurally different for cheap geometric
+cleanup, consistent with an information gap rather than a fixable shape
+defect.
+
+## Fix attempt 6 (tried 2026-07-06): hardness-based loss reweighting — also did NOT help
+
+Theory: with every training sample weighted equally, the ~64% "good" tier
+(where blind copy-through of TEUNet's hint is already near-optimal)
+dominates the average loss, leaving little gradient incentive to learn real
+correction behavior on the ~13% "poor" tier where it actually matters. Kept
+v1's exact architecture and plain GT footprint (capacity and structural
+fixes already ruled out) and changed only the loss: `configs/gpr/gpr_diffusion_v5.yaml`
+sets `use_hardness_reweight: true`, `hardness_scale: 3.0`. New
+`hardness_scale` param on `GPRDataset` (`xcube/data/gpr.py`) computes
+`weight = 1 + hardness_scale * (1 - IoU(TEUNet, GT))` per sample (range
+~1.16-3.61 across a random subset, mean ~2.05 — sensible spread, not
+degenerate); `use_hardness_reweight` in `xcube/models/diffusion.py` switches
+`compute_loss` from a flat mean MSE to a per-voxel-weighted mean (voxel
+weight looked up via `jidx` from its sample's `DS.LOSS_WEIGHT`). Trained 50
+epochs (`checkpoints/gpr/Diffusion_stage2_v5/version_0`, ~8hr — faster than
+v4-capacity since this reused v1's smaller network). Full 198-sample eval
+(`scripts/results/stage2_full_test_v5reweight_198samples.txt`):
+
+| Tier | n | v5-reweight IoU vs GT | TEUNet IoU vs GT | Diff |
+|---|---|---|---|---|
+| Good | 126 | 0.807 | 0.816 | −0.009 |
+| Moderate | 46 | 0.573 | 0.580 | −0.007 |
+| Poor | 26 | 0.089 | 0.085 | +0.004 |
+| **Overall** | **198** | **0.658** | **0.665** | **−0.007** |
+
+Overall lands within the same noise band as v1/v2/v3 (0.655/0.652/0.657) —
+no regression like v4-capacity, but no real gain either. **Poor tier is the
+key number: +0.004, identical to v1's +0.004 and v2's +0.004/v3's +0.005**
+— despite up to ~3.6x more training loss weight on exactly these samples,
+zero additional correction ability resulted. Strong evidence the model
+isn't failing to prioritize hard cases (which reweighting would fix); it's
+that TEUNet's signal genuinely contains no recoverable information for
+those cases, so no amount of training emphasis can manufacture a correction
+signal that isn't there.
+
+## Status as of today (2026-07-06)
+
+Six fix attempts completed (three training-regime variants, one structural
+free-gen experiment, one capacity increase, one loss-reweighting) plus a
+full poor-tier visual audit and a post-processing gap-bridging test. All six
+training variants land at or below the ~0.65-0.66 ceiling, just shy of
+TEUNet's own 0.665 baseline, and the post-processing test rules out cheap
+geometric cleanup too. Combined with the audit finding 38% of poor-tier
+samples are complete spatial misses with zero recoverable signal, the
+conclusion holds firmly: the bottleneck is informational, not architectural,
+training-regime, loss-weighting, or post-processing based.
+
+**Waiting on**: raw GPR scan data access (pre-TEUNet signal), expected
+~2026-07-05. This is the prerequisite for any meaningful next attempt on
+Pattern A (complete miss) samples, which make up the largest fraction of
+poor-tier failures. No further training-time or architecture tweaks are
+worth trying against TEUNet's output alone until that data lands.
