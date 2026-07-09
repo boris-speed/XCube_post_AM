@@ -1,0 +1,92 @@
+include_configs:
+  - ../train/diffusion/diffusion_128x128x128_sparse.yaml
+  - gpr.yaml
+
+name: 'gpr/Diffusion_stage2_v6_material'
+
+# --- Stage 2 v6 (this config): retrain on the new corr_medium dataset
+# (10,000 samples, in-distribution/medium-difficulty per its README -- see
+# PROGRESS.md), and adds material conditioning as the one new variable on top
+# of v1's plain architecture/footprint (capacity, dilation, classifier-free
+# dropout, and loss reweighting were all already ruled out on the original
+# TEUNet dataset). The Step1 prediction's per-voxel material class is encoded
+# alongside its grid structure (see use_cond_material in diffusion.py's
+# encode_cond_grid), through the same frozen VAE encoder used for the main
+# latent -- requires vae_config/vae_checkpoint below to point at a VAE
+# trained with use_input_material: true (gpr_vae_corr_medium.yaml).
+train_kwargs:
+  input_key: "target_grid"
+val_kwargs:
+  input_key: "target_grid"
+test_kwargs:
+  input_key: "target_grid"
+
+resolution: "0.005"
+
+# --- Frozen Stage 1 VAE: provides the latent space we denoise into. ---
+# version_1 = the real 50-epoch corr_medium+material retrain (version_0 was
+# just the smoke test).
+vae_config: "/home/ameliacatala/Documents/XCube/configs/gpr/gpr_vae_corr_medium.yaml"
+vae_checkpoint: "/home/ameliacatala/Documents/checkpoints/gpr/VAE_stage1_corr_medium/version_1/checkpoints/last.ckpt"
+
+# --- Condition on the Step1 prediction's grid via concat (see
+# xcube/models/diffusion.py's use_cond_grid_concat_cond branch in
+# _forward_cond), plus its material class (use_cond_material). ---
+conditioning_key: "concat"
+use_cond_grid_concat_cond: true
+use_cond_material: true
+# num_classes = condition latent's channel count = VAE's own latent channel count,
+# since the condition is encoded through that same VAE encoder:
+#   f_maps(32) * 2^(num_blocks(2)-1) / cut_ratio(4) = 16
+num_classes: 16
+
+log_image: false  # skip the periodic sampling/visualization for now -- not wired up yet
+
+ema: false
+scale_by_std: true
+use_ddim: true
+num_inference_steps: 100
+
+num_train_timesteps: 1000
+beta_start: 0.0001
+beta_end: 0.02
+beta_schedule: "linear"
+prediction_type: "epsilon"
+
+supervision:
+  mse_weight: 1.0
+
+optimizer: "Adam"
+learning_rate:
+  init: 5.0e-5
+  decay_mult: 1.0
+  decay_step: 2000000000  # effectively constant learning rate
+  clip: 1.0e-6
+weight_decay: 0.0
+grad_clip: 0.5
+
+# --- Same architecture as v1: capacity was already ruled out (v4-capacity
+# landed below v1-v3's ceiling), so this isolates material conditioning as
+# the only new variable (besides the new dataset itself). ---
+network:
+  diffuser_name: "UNetModel_Sparse"
+  diffuser:
+    dims: 3
+    image_size: [32, 32, 24]
+    model_channels: 32
+    use_middle_attention: false
+    channel_mult: [1, 2]
+    attention_resolutions: []
+    num_res_blocks: 1
+    num_heads: 4
+  scheduler:
+    num_train_timesteps: ${num_train_timesteps}
+    beta_start: ${beta_start}
+    beta_end: ${beta_end}
+    beta_schedule: ${beta_schedule}
+    variance_type: "fixed_small"
+    clip_sample: False
+    prediction_type: ${prediction_type}
+
+batch_size: 2
+train_val_num_workers: 4

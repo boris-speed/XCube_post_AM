@@ -161,6 +161,13 @@ class Model(BaseModel):
         # for the main latent, then concatenating it onto the noisy latent.
         if not hasattr(self.hparams, 'use_cond_grid_concat_cond'):
             self.hparams.use_cond_grid_concat_cond = False
+        # Material conditioning (see PROGRESS.md): whether to also encode the
+        # Step1 prediction's per-voxel material class alongside its grid
+        # structure when encoding COND_PC. Requires a frozen VAE whose own
+        # hparams.use_input_material is True (its encoder's mix_fc was sized
+        # and trained to accept the extra channel).
+        if not hasattr(self.hparams, 'use_cond_material'):
+            self.hparams.use_cond_material = False
         # Structural-confinement fix (see PROGRESS.md): the decoder can only ever
         # subdivide cells within the coarse footprint it starts from. Training
         # always handed it GT's always-correct footprint, so it never practiced
@@ -339,12 +346,21 @@ class Model(BaseModel):
         return self.vae._encode(batch, use_mode=False)
 
     @torch.no_grad()
-    def encode_cond_grid(self, cond_grid):
+    def encode_cond_grid(self, cond_grid, cond_material=None):
         # Shared by training (forward/_forward_cond) and real inference
         # (evaluation_api) so the dilation amount is always applied consistently.
         if self.hparams.cond_grid_dilation_kernel > 1:
             cond_grid = cond_grid.conv_grid(self.hparams.cond_grid_dilation_kernel, 1)
-        return self.vae._encode({DS.INPUT_PC: cond_grid}, use_mode=True)
+        encode_batch = {DS.INPUT_PC: cond_grid}
+        if self.hparams.use_cond_material:
+            # cond_material must already align 1:1 with cond_grid's (pre-dilation)
+            # voxel order -- dilation only changes cond_grid's structure above, so
+            # if cond_grid_dilation_kernel > 1 this pairing would need re-deriving;
+            # not combined with material conditioning in the current experiments.
+            assert self.hparams.cond_grid_dilation_kernel <= 1, \
+                "cond_grid dilation + material conditioning together isn't supported yet"
+            encode_batch[DS.INPUT_MATERIAL] = cond_material
+        return self.vae._encode(encode_batch, use_mode=True)
 
     def get_pos_embed(self, h):
         return h[:, :3]
@@ -474,7 +490,8 @@ class Model(BaseModel):
             if cond_dict is not None and 'cond_grid_latent' in cond_dict:
                 cond_latent = cond_dict['cond_grid_latent']
             elif batch is not None:
-                cond_latent = self.encode_cond_grid(batch[DS.COND_PC])
+                cond_material = batch[DS.COND_MATERIAL] if self.hparams.use_cond_material else None
+                cond_latent = self.encode_cond_grid(batch[DS.COND_PC], cond_material)
             else:
                 cond_latent = cond_dict['cond_grid_latent']
             # TEUNet's grid generally occupies different voxels than the GT grid we're
@@ -575,7 +592,8 @@ class Model(BaseModel):
                 # structure it faces at real test time. GT's true feature values are
                 # aligned onto that footprint (zero-filled wherever TEUNet's footprint
                 # doesn't reach) -- that aligned result is what actually gets noised.
-                cond_latent = self.encode_cond_grid(batch[DS.COND_PC])
+                cond_material = batch[DS.COND_MATERIAL] if self.hparams.use_cond_material else None
+                cond_latent = self.encode_cond_grid(batch[DS.COND_PC], cond_material)
                 gt_latent = self.extract_latent(batch)
                 aligned_feature = cond_latent.grid.fill_to_grid(gt_latent.feature, gt_latent.grid, 0.0)
                 latents = VDBTensor(cond_latent.grid, aligned_feature)
@@ -845,7 +863,8 @@ class Model(BaseModel):
             # real TEUNet grid passed in via `batch`, not from a previous stage's result.
             if batch is not None:
                 # Original: cond_dict['cond_grid_latent'] = self.vae._encode({DS.INPUT_PC: batch[DS.COND_PC]}, use_mode=True)
-                cond_dict['cond_grid_latent'] = self.encode_cond_grid(batch[DS.COND_PC])
+                cond_material = batch[DS.COND_MATERIAL] if self.hparams.use_cond_material else None
+                cond_dict['cond_grid_latent'] = self.encode_cond_grid(batch[DS.COND_PC], cond_material)
             else:
                 raise NotImplementedError("use_cond_grid_concat_cond needs a real TEUNet grid passed via `batch`")
 
@@ -935,6 +954,8 @@ class Model(BaseModel):
             all_specs.append(DS.MICRO)
         if self.hparams.use_cond_grid_concat_cond:
             all_specs.append(DS.COND_PC)
+        if self.hparams.use_cond_material:
+            all_specs.append(DS.COND_MATERIAL)
         return all_specs
     
     def get_collate_fn(self):

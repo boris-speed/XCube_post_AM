@@ -98,6 +98,14 @@ class GPRDataset(RandomSafeDataset):
         if DS.INPUT_INTENSITY in self.spec:
             data[DS.INPUT_INTENSITY] = input_data['input_prob']
 
+        # Material, per-voxel, aligned to whichever grid is DS.INPUT_PC right now:
+        # GT's own material when self-reconstructing GT (input_key="target_grid",
+        # Stage 1 and Stage 2's main latent), the Step1 prediction's material
+        # otherwise. Mirrors the input_key branch above exactly.
+        if DS.INPUT_MATERIAL in self.spec:
+            material_key = 'target_material' if self.input_key == 'target_grid' else 'input_material'
+            data[DS.INPUT_MATERIAL] = input_data[material_key]
+
         # Stage 2 (diffusion) needs both grids at once: the GT shape (as INPUT_PC,
         # via input_key="target_grid" in the diffusion config) to learn/denoise, and
         # TEUNet's flawed grid as a separate conditioning hint -- always from
@@ -105,6 +113,12 @@ class GPRDataset(RandomSafeDataset):
         # TEUNet's reconstruction in the saved .pkl.
         if DS.COND_PC in self.spec:
             data[DS.COND_PC] = input_data['input_grid']
+
+        # Material aligned with COND_PC specifically (always the prediction's
+        # material, regardless of input_key) -- needed since Stage 2 encodes
+        # COND_PC through the frozen VAE separately from INPUT_PC.
+        if DS.COND_MATERIAL in self.spec:
+            data[DS.COND_MATERIAL] = input_data['input_material']
 
         if self.hardness_scale > 0:
             teunet_ijk = set(map(tuple, input_data['input_grid'].ijk[0].jdata.cpu().numpy().tolist()))

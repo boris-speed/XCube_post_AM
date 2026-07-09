@@ -52,6 +52,14 @@ class DatasetSpec(Enum):
     # Per-sample training loss weight (e.g. GPR's hardness-based reweighting,
     # see xcube/data/gpr.py) -- a plain float, collated into a (batch,) tensor.
     LOSS_WEIGHT = 1650
+    # GPR material conditioning: per-voxel material class index (int), aligned
+    # 1:1 with whichever grid is DS.INPUT_PC at the time (GT's own material
+    # when input_key="target_grid", the Step1 prediction's material otherwise).
+    INPUT_MATERIAL = 1660
+    # Material aligned with DS.COND_PC specifically (always the Step1
+    # prediction's grid, regardless of input_key) -- needed because Stage 2
+    # encodes COND_PC separately from INPUT_PC through the same frozen encoder.
+    COND_MATERIAL = 1670
 
 class RandomSafeDataset(Dataset):
     """

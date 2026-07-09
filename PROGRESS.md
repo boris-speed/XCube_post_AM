@@ -455,3 +455,267 @@ training-regime, loss-weighting, or post-processing based.
 Pattern A (complete miss) samples, which make up the largest fraction of
 poor-tier failures. No further training-time or architecture tweaks are
 worth trying against TEUNet's output alone until that data lands.
+
+**Update (2026-07-09): the true raw signal would be the A-scan** (the raw
+GPR waveform, pre-*any* neural network) — but the data owner declined to
+provide A-scan access, for reasons not stated to us. What was provided
+instead, below, is another model's (Step1's) processed predictions, not the
+raw signal. This matters: it means the original hypothesis behind this whole
+data request — that Pattern A misses are fixable given access to genuinely
+raw, pre-model information — remains untested. corr_medium is a real new
+data source and worth trying, but it does not by itself resolve the
+information-gap diagnosis; see the in-distribution caveat below.
+
+## New data source: corr_medium Step1 predictions (arrived 2026-07-07)
+
+Requested as the raw-GPR-signal data; what actually landed was a GT/prediction
+pair from a **Step1 model** (a different, earlier-pipeline-stage model — not
+TEUNet, and not the raw A-scan — see note above):
+`corr_medium_gt_voxel_radius.h5` and `corr_medium_step1_pred_voxel_radius.h5`,
+10,000 paired samples, in
+`/home/ameliacatala/Documents/corr_medium_gt_voxel_radius/`.
+
+### Preprocessing (`datagen/preprocess_gpr_corr_medium.py`)
+
+Converts this pair into the exact same `.pkl` format `preprocess_gpr.py`
+produces, so it drops into the existing `GPRDataset`/Stage 1/Stage 2 code
+unchanged. Key differences from the original TEUNet source format:
+
+- Single `.h5` file per split holding all 10,000 samples (vs. one `.h5` file
+  per sample originally).
+- Volume axis order in the source is (D,H,W) = (48,64,64); transposed to
+  (X,Y,Z) = (64,64,48) to match `GPRDataset`'s existing convention.
+- Occupancy (`pipe_mask`) is already boolean on both GT and prediction sides
+  — no probability threshold needed. The prediction's `confidence` field
+  (dense probability at occupied voxels) fills the role TEUNet's continuous
+  `input_prob` played before.
+- Isotropic 0.005m voxel spacing (vs. TEUNet's near-isotropic but not exactly
+  equal per-axis spacing).
+
+Same per-sample Dice-score tiering and 80/10/10 stratified split as the
+original pipeline.
+
+**Result**: 10,000/10,000 samples processed, 0 skipped, all spot-checks
+passed. Output: `/home/ameliacatala/Documents/preprocess/data_full/gpr_corr_medium/0.005/`
+(6.7G), splits `train.lst`/`val.lst`/`test.lst` (8,002/999/999 entries).
+
+Tier breakdown — notably different balance from the original TEUNet dataset:
+
+| Tier | corr_medium (n=10,000) | Original TEUNet (n=1,973) |
+|---|---|---|
+| Good (>0.8) | 6,143 (61.4%) | 1,257 (63.7%) |
+| Moderate (0.5-0.8) | 3,725 (37.3%) | 455 (23.1%) |
+| Poor (<0.5) | 132 (1.3%) | 261 (13.2%) |
+
+Poor tier is far smaller proportionally here (1.3% vs. 13.2%).
+
+**Important caveat (from `README_corr_medium_voxel_radius.md`, packaged with
+the source data): this is NOT the hoped-for harder/OOD signal.** The dataset
+is explicitly medium-difficulty and **in-distribution** relative to the Step1
+model's own training set (checkpoint `gpr_topo_step1/runs/real_v9/best.pt`) —
+the README states plainly: *"the prediction quality is expected to look
+strong. A diffusion model may not necessarily improve these results much."*
+So the small poor-tier share above likely reflects a curated, easier subset,
+**not** evidence that this Step1 model is a fundamentally richer signal than
+TEUNet for the hard Pattern-A (complete spatial miss) cases this project
+actually needs solved. The README also names two specific known failure
+modes in this data — pipes near a patch's bottom sometimes missed entirely,
+and pipes cut by the patch boundary becoming poor-quality half-pipes — both
+flagged as likely hard for a diffusion model to fix too.
+
+The README also documents two per-voxel fields present in both H5 files but
+**not currently used** by the preprocessing script: `radius_m` (physical pipe
+radius per voxel, float16, zero outside `pipe_mask`) and `material` (pipe
+material class per voxel, int16, `-1` outside `pipe_mask`). Both are ignored
+because the existing `.pkl` schema (`target_grid`/`input_grid`/`input_prob`),
+inherited unchanged from the TEUNet pipeline, has no field for them — using
+them would require extending the schema and the Stage 1/2 models themselves.
+
+**Next step**: given the in-distribution caveat, treat this dataset as a
+useful additional training/validation source rather than a confirmed fix for
+Pattern-A failures. Worth checking whether the source data can also provide a
+genuinely harder/OOD split before concluding it addresses the poor-tier
+information gap identified earlier.
+
+**Verified 2026-07-08**: checked a random 200-sample subset directly -- worst
+Dice was 0.39, zero samples at exactly 0.000, consistent with the README's
+overall worst of 0.234. Confirms no Pattern-A-style complete misses in this
+dataset (unlike the original TEUNet data).
+
+## Material conditioning (implemented 2026-07-08)
+
+`corr_medium`'s H5 files also carry a per-voxel `material` class (int16, `-1`
+outside `pipe_mask`; observed classes `{0,1,2,3}` across GT+prediction). A
+third field, `radius_m`, was considered but skipped: `pipe_mask` is already a
+radius-expanded mask, so `radius_m` is largely redundant with occupancy shape
+-- `material` is the genuinely new signal, useful for tasks like Pattern-C
+fragment consolidation (matching fragments by material continuity), though it
+does **not** address Pattern-A complete misses (both `radius_m` and
+`material` are undefined outside `pipe_mask`, so there's still nothing to
+condition on where the prediction found zero voxels).
+
+**Key finding that reshaped the implementation**: traced how conditioning
+actually reaches the model and found `confidence`/`input_prob` -- present
+since the original pipeline -- was **never actually consumed**. It's wired
+through `DS.INPUT_INTENSITY`, gated by VAE hparam `use_input_intensity`
+(`false` in `gpr_vae.yaml`), and even when enabled, Stage 2's
+`encode_cond_grid()` (which reuses the **frozen** Stage 1 VAE encoder to
+encode the conditioning grid) never passed intensity data to it at all --
+only grid positions. This meant the frozen encoder's first layer (`mix_fc`)
+was never trained to accept any extra per-voxel channel, so material
+conditioning requires retraining Stage 1's encoder with the new input
+dimension, not just a Stage-2-only change. Since Stage 1 needed retraining
+anyway (new corr_medium data), this is folded into that retrain rather than
+being extra overhead.
+
+### Design
+
+Mirrors the existing `use_input_semantic` pattern in
+`xcube/modules/autoencoding/base_encoder.py` (categorical class index through
+a learned `nn.Embedding`, concatenated onto the position-embedded features
+before `mix_fc`) rather than one-hot encoding manually.
+
+- `xcube/data/base.py`: two new `DatasetSpec` entries --
+  `INPUT_MATERIAL` (aligned with whatever `INPUT_PC` currently is: GT's
+  material when `input_key="target_grid"`, the Step1 prediction's material
+  otherwise) and `COND_MATERIAL` (always the Step1 prediction's material,
+  aligned with `COND_PC`, since Stage 2 encodes that grid separately from
+  `INPUT_PC` through the same frozen encoder).
+- `xcube/modules/autoencoding/base_encoder.py`: new `use_input_material`,
+  `num_material`, `dim_material` hparams; `nn.Embedding(num_material,
+  dim_material)` on the raw class index, concatenated into `unet_feat`.
+- `xcube/models/autoencoder.py`: `get_dataset_spec()` requests
+  `DS.INPUT_MATERIAL` when the flag is set.
+- `xcube/data/gpr.py`: `_get_item` populates `DS.INPUT_MATERIAL` from
+  `target_material` or `input_material` in the `.pkl` depending on
+  `input_key`, and `DS.COND_MATERIAL` always from `input_material`.
+- `xcube/models/diffusion.py`: new `use_cond_material` hparam;
+  `encode_cond_grid()` takes an optional `cond_material` argument and passes
+  `DS.INPUT_MATERIAL` through to the frozen VAE's `_encode` call alongside
+  `DS.INPUT_PC`; all three call sites (`_forward_cond`, `forward`'s
+  `train_cond_footprint` branch, `evaluation_api`) updated; `get_dataset_spec`
+  requests `DS.COND_MATERIAL` when the flag is set.
+- `datagen/preprocess_gpr_corr_medium.py`: `build_sample()` now also extracts
+  `target_material` (GT's material at GT-occupied voxels) and
+  `input_material` (Step1 prediction's material at its occupied voxels),
+  stored as `int8` (only 4 classes -- keeps the dataset small; grew from 6.7G
+  to 7.0G for all 10,000 samples). Regenerated the full dataset with this
+  field 2026-07-08.
+- New configs: `configs/gpr/gpr_vae_corr_medium.yaml` (Stage 1, retrained on
+  corr_medium instead of the original 1973-sample TEUNet/GT set,
+  `use_input_material: true`, `num_material: 4`, `dim_material: 8`) and
+  `configs/gpr/gpr_diffusion_v6_material.yaml` (Stage 2, `use_cond_material:
+  true`, otherwise v1's plain architecture/footprint -- isolates material
+  conditioning as the one new variable on top of the new dataset).
+
+Smoke-tested (5 train / 2 val batches) before committing to the full run --
+material embedding shapes align correctly, loss decreases normally, no
+crashes.
+
+**Unrelated environment fix needed along the way**: the JIT CUDA extension
+build (`ext/common`, used by `color_util.py`) started failing with `nvcc`
+rejecting the conda env's own bundled `gcc` (14.3.0 -- CUDA 12.4 supports up
+to 13) as the host compiler, even though a working cached `.so` already
+existed. Root cause not fully pinned down, but coincides with the shared
+machine's disk-space issue being resolved by another user (see below) --
+possibly a system change invalidated cached intermediate build objects.
+Fixed by forcing `CC=/usr/bin/gcc-12 CXX=/usr/bin/g++-12` (system compilers,
+CUDA-12.4-compatible) when invoking `train.py`. Needed for any future
+training run on this machine, not specific to material conditioning.
+
+### Status as of 2026-07-08
+
+Stage 1 retrain running in the user's own terminal (not backgrounded by
+Claude this time), **50 epochs** (not 100 -- the original Stage 1 run's 100
+epochs was overkill; the loss curve had already flattened well before that,
+and 50 was judged sufficient here), `--wname corr_medium_material_50ep`, log
+at `~/vae_corr_medium_material_50ep.log`. Measured smoke-test rate (~3.3 it/s,
+4,501 steps/epoch) gives an estimate of **~19 hours total** (~22-23
+min/epoch, corr_medium's 10,000 samples being ~5x the original dataset).
+Also needed an unrelated environment fix along the way (see above): `nvcc`
+rejecting the conda env's own gcc 14 as host compiler, fixed via
+`CC=/usr/bin/gcc-12 CXX=/usr/bin/g++-12`.
+
+Once finished, Stage 2 (`gpr_diffusion_v6_material.yaml`) needs its
+`vae_checkpoint` path updated to the real `version_N` output directory
+(under `checkpoints/gpr/VAE_stage1_corr_medium/`) before training.
+
+## Aside: shared-machine disk-space incident (2026-07-08)
+
+Unrelated to the research itself, but affected ability to run jobs during
+this session: the shared machine's root filesystem hit 926G/926G (15M free),
+traced to ~750G used by another user's data that `du`/`lsof` under a
+non-root account couldn't fully diagnose. Freed ~12G in the meantime via
+safe local cleanup (removed unused `herb-phenology` conda env, stale
+training logs, an unrelated project folder). The other user's data was later
+cleared on their end, restoring ~462G free. Not logged further here since
+it's infra, not modeling -- noted only because it explains why the full
+corr_medium preprocessing run initially failed and had to be redone.
+
+## Stage 1 corr_medium+material retrain finished; Stage 2 v6 launched (2026-07-09)
+
+**Stage 1 result**: `checkpoints/gpr/VAE_stage1_corr_medium/version_1`, 50
+epochs on the full 10,000-sample corr_medium dataset with material
+conditioning. Validation loss 0.85 -> 0.31 (train 1.34 -> 0.27), structure
+accuracy (finest tree level, `struct-acc-0`) 98.8% -> 99.6%, still trending
+down/up slightly at epoch 49 (not fully flattened, unlike the original
+100-epoch Stage 1 run on the smaller dataset). The coarser tree level
+(`struct-acc-1`) sits at a trivial flat 100% throughout. Curve plots:
+`vae_stage1_corr_medium_training.png`. Before/during/after reconstruction
+visual (`scripts/visualize_vae_reconstruction.py`, one GT input sample vs.
+the coarse depth-1 structure vs. the final depth-0 reconstruction) saved to
+`vae_reconstruction_visual.png` -- reconstruction closely matches the input,
+consistent with the measured accuracy.
+
+**Stage 2 v6 (`configs/gpr/gpr_diffusion_v6_material.yaml`)**: updated
+`vae_checkpoint` to point at the real `version_1` checkpoint (was still a
+`version_0` smoke-test placeholder). Smoke-tested (5 train/2 val batches)
+against the new checkpoint -- material embedding + corr_medium dataset load
+cleanly, loss behaves as expected for a fresh diffusion model (~0.997).
+
+Launched the real 50-epoch run in the user's own terminal (nohup,
+`~/v6_material_training.log`), `checkpoints/gpr/Diffusion_stage2_v6_material/version_0`.
+Measured rate ~13.75 it/s, 40,260 steps/epoch -> ~49 min/epoch, so **~41
+hours for 50 epochs** (corr_medium's 10,000 samples vs. the original
+dataset's 1,973 is the main driver, consistent with Stage 1's own ~5x
+slowdown). Given every prior Stage 2 attempt (v1-v5) converged/plateaued by
+epoch ~25-30, plan is to check the in-progress checkpoint at that point
+(~24h in, not the full 50) and decide whether to let it keep running or stop
+-- `last.ckpt` updates continuously so stopping early loses nothing.
+
+**Why this run might still land at the same ~0.65-0.66 ceiling as v1-v5**:
+the strongest evidence so far that the model just passes its conditioning
+input through rather than doing real generative correction is the VAE
+round-trip test (zero diffusion, just encode/decode TEUNet's grid, scored
+almost identically to the full trained model) and fix attempt 3 (classifier-free
+dropout -- forcibly removing the conditioning signal during training some of
+the time -- also didn't unlock any real correction behavior). Neither more
+data of a similar statistical character, nor a new conditioning channel
+(material class), changes *what the training loss rewards* -- copying
+through is only an easy shortcut because the condition is usually already
+close to correct, and corr_medium's Step1 predictions are, if anything, even
+closer to correct on average than TEUNet's were (poor-tier share 13.2% ->
+1.3%), so the shortcut may be even more attractive here, not less.
+
+Countering that: the diagnosis above was built entirely from TEUNet-conditioned
+training. If Step1's error profile is qualitatively different (more
+small/local imperfections, less of TEUNet's catastrophic complete-miss
+failure mode) rather than just quantitatively smaller, the model would be
+training on a genuinely different distribution of correction problems than
+the one that produced the "it just copies" diagnosis -- so it's a real open
+question, not a settled one, until the checkpoint eval actually runs.
+
+**If this also lands flat, remaining untried directions** (in rough order of
+promise): (1) request actual A-scan (raw waveform, pre-any-model) access
+again -- corr_medium was requested as this but the data owner declined to
+provide the true raw signal and gave Step1's processed predictions instead,
+so the original hypothesis behind the whole data request is still untested;
+(2) train against a *corrupted* conditioning signal (not just occasionally
+absent, as classifier-free dropout already tried) so blind copy-through
+reliably produces high loss, forcing the network away from the shortcut;
+(3) check whether the model has hidden correction capacity being averaged
+away by deterministic single-sample DDIM evaluation, by sampling multiple
+times per input and inspecting variance; (4) reframe the deliverable around
+the diagnosis itself (a rigorous elimination of architecture/training-regime/
+data-scale causes, isolating the bottleneck as informational) rather than a
+successful IoU improvement, if that fits the project's actual goal.

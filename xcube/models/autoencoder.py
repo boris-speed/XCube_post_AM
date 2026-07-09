@@ -201,6 +201,8 @@ class Model(BaseModel):
             all_specs.append(DS.GT_SEMANTIC)
         if self.hparams.use_input_intensity:
             all_specs.append(DS.INPUT_INTENSITY)
+        if self.hparams.use_input_material:
+            all_specs.append(DS.INPUT_MATERIAL)
         return all_specs
 
     def get_collate_fn(self):

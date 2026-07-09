@@ -25,12 +25,15 @@ class Encoder(nn.Module):
         if self.hparams.use_input_semantic:
             encoder_input_dims += self.hparams.dim_semantic
             self.semantic_embed_fn = nn.Embedding(self.hparams.num_semantic, self.hparams.dim_semantic)
+        if self.hparams.use_input_material:
+            encoder_input_dims += self.hparams.dim_material
+            self.material_embed_fn = nn.Embedding(self.hparams.num_material, self.hparams.dim_material)
         if self.hparams.use_input_color:
             encoder_input_dims += 3
 
         embed_fn, input_ch = get_embedder(5)
         self.pos_embedder = embed_fn
-        
+
         input_dim = 0
         input_dim += input_ch
         if self.hparams.use_input_normal:
@@ -39,6 +42,8 @@ class Encoder(nn.Module):
             input_dim += 1
         if self.hparams.use_input_semantic:
             input_dim += self.hparams.dim_semantic
+        if self.hparams.use_input_material:
+            input_dim += self.hparams.dim_material
         if self.hparams.use_input_color:
             input_dim += 3 # color
             
@@ -71,7 +76,12 @@ class Encoder(nn.Module):
         if self.hparams.use_input_intensity:
             input_intensity = fvdb.JaggedTensor(batch[DS.INPUT_INTENSITY])
             unet_feat = torch.cat([unet_feat, input_intensity.jdata], dim=1)
-            
+
+        if self.hparams.use_input_material:
+            input_material = fvdb.JaggedTensor(batch[DS.INPUT_MATERIAL])
+            input_material_embed = self.material_embed_fn(input_material.jdata.long())
+            unet_feat = torch.cat([unet_feat, input_material_embed], dim=1)
+
         if self.hparams.use_input_color:
             input_color = fvdb.JaggedTensor(batch[DS.INPUT_COLOR])
             unet_feat = torch.cat([unet_feat, input_color.jdata], dim=1)

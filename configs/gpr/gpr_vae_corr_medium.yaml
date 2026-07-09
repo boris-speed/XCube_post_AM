@@ -1,0 +1,60 @@
+include_configs:
+  - ../train/vae/vae_128x128x128_sparse.yaml
+  - gpr.yaml
+
+name: 'gpr/VAE_stage1_corr_medium'
+
+# --- Stage 1 corr_medium (this config): retrain of gpr_vae.yaml on the new,
+# larger corr_medium dataset (10,000 samples vs. the original 1973), and adds
+# material conditioning (see PROGRESS.md): the VAE now also encodes each
+# occupied voxel's material class (GT's own material, aligned with target_grid,
+# since input_key="target_grid" below) alongside its position, via a small
+# learned nn.Embedding, mirroring how use_input_semantic already works. ---
+train_kwargs:
+  input_key: "target_grid"
+val_kwargs:
+  input_key: "target_grid"
+test_kwargs:
+  input_key: "target_grid"
+
+# --- GPR voxel grid setup: corr_medium is isotropic 0.005m, unlike the ---
+# --- original TEUNet/GT dataset's near-isotropic (but not exactly equal) ---
+# --- per-axis spacing.                                                   ---
+voxel_size: [0.005, 0.005, 0.005]
+resolution: "0.005"
+tree_depth: 2
+use_fvdb_loader: true
+use_hash_tree: true
+
+use_input_normal: false
+use_input_semantic: false
+use_input_intensity: false
+use_input_material: true
+num_material: 4    # observed classes {0,1,2,3} across GT+prediction material fields
+dim_material: 8
+
+supervision:
+  structure_weight: 20.0
+  normal_weight: 0.0
+
+# --- smaller network: GPR grids (64x64x48) are tiny vs Waymo's 512^3+ scenes ---
+cut_ratio: 4
+network:
+  encoder:
+    c_dim: 32
+  unet:
+    target: "StructPredictionNet"
+    params:
+      in_channels: 32
+      num_blocks: ${tree_depth}
+      f_maps: 32
+      neck_dense_type: "UNCHANGED"
+      neck_bound: [32, 32, 24]
+      num_res_blocks: 1
+      use_residual: false
+      order: "gcr"
+      is_add_dec: false
+      use_attention: false
+      use_checkpoint: false
+
+batch_size: 2
