@@ -15,14 +15,45 @@ name: 'gpr/VAE_stage1_corr_medium_v2_coarse_dilation'
 # structure architecturally unreachable given Step1's coarse footprint.
 #
 # Fix: dilate the coarsest decode-level candidate grid during training itself
-# (kernel_size=3 -> 1-cell margin at the coarse level, same conv_grid
-# mechanism as the TEUNet-era test-time dilation experiments, but this time
-# applied inside Stage 1's own training loop so struct_conv actually learns
-# to prune the added false margin while keeping/filling true cells, rather
-# than a frozen decoder that never practiced with anything but an
-# exactly-correct footprint). See xcube/modules/autoencoding/sunet.py
-# StructPredictionNet.decode().
+# (kernel_size=7 -> 3-cell margin at the coarse level), applied inside Stage
+# 1's own training loop so struct_conv actually learns to prune the added
+# false margin while keeping/filling true cells, rather than a frozen decoder
+# that never practiced with anything but an exactly-correct footprint). See
+# xcube/modules/autoencoding/sunet.py StructPredictionNet.decode().
+#
+# NOTE (2026-07-15): the dilation mechanism itself was rewritten -- the
+# original implementation used GridBatch.conv_grid(kernel_size, stride=1),
+# which does NOT grow the active voxel set (verified: identical footprint for
+# every kernel size tried). decode() now uses set_from_ijk's pad_min/pad_max
+# instead, which genuinely pads a box of neighbors around every active
+# coordinate. This also invalidates the "dilation doesn't help" conclusion
+# from the two TEUNet-era dilation attempts (Part 1, fix attempts 1-2), which
+# used the same broken conv_grid call.
+#
+# NOTE (2026-07-15): kernel_size raised from 3 to 7 after measuring how much
+# of the poor tier's missing structure a given margin can actually reach
+# (scripts/test_unreachable_distance.py): margin=1 (kernel=3) only recovers
+# ~10% of poor tier's missing structure; margin=3 (kernel=7) recovers ~35%
+# (~74% on good tier). A much larger margin=5 (kernel=11) would recover more
+# (~54% poor tier) but moves further into the "too much untrusted room"
+# territory that collapsed to ~0 IoU in TEUNet fix attempt 4 (Part 1, fully
+# open candidate region) -- kernel=7 was chosen as the more conservative step.
+#
+# NOTE (2026-07-16): kernel=7's first real run (version_1) improved the
+# architectural ceiling roughly as predicted (poor-tier unreachable structure
+# 48.2% -> 26.7%), but round-trip IoU collapsed (0.66 -> 0.11 overall) because
+# the coarsest level's plain (unweighted) cross-entropy loss got flooded with
+# ~4x more mostly-empty candidate cells from the dilation, and learned an
+# overly conservative "when in doubt, discard" policy -- it kept only 3,248 of
+# the widened 21,518-cell candidate pool for one checked sample, fewer than
+# the 5,326 cells the undilated model used to correctly keep outright. Added
+# `balance_struct_loss` (xcube/modules/autoencoding/losses/base_loss.py) to
+# counteract this via per-batch inverse-frequency class weighting -- has
+# little effect where classes are already balanced (finer levels) and
+# corrects specifically where dilation skews the ratio (the coarsest level).
 network:
   unet:
     params:
-      coarse_dilation_kernel: 3
+      coarse_dilation_kernel: 7
+supervision:
+  balance_struct_loss: true

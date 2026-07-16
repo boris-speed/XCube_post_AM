@@ -881,36 +881,249 @@ has to change how Stage 1 is trained** — teaching the VAE's own coarse-level
 structure prediction to productively use a wider, less literal candidate
 region — not a Stage 2 change and not just a test-time dilation.
 
+## v7 (corrupted conditioning) finished; Stage 1 coarse-dilation VAE finished but was a no-op — real dilation implemented and relaunched (2026-07-15)
+
+**v7 finished its full 50 epochs** (`checkpoints/gpr/Diffusion_stage2_v7_corrupted/version_0`,
+`Trainer.fit stopped: max_epochs=50 reached`). Not yet run through the full
+999-sample evaluation script — still pending, expected to land ~flat per the
+VAE round-trip finding, but not yet a confirmed number.
+
+**The Stage 1 coarse-dilation VAE retrain (`VAE_stage1_corr_medium_v2_coarse_dilation/version_0`,
+described in the previous entry) also finished its 50 epochs, but evaluating
+it exposed a critical bug: its "dilation" never actually happened.**
+
+`decode()`'s dilation step (`xcube/modules/autoencoding/sunet.py`) used
+`GridBatch.conv_grid(kernel_size, stride=1)`, believing it widens the active
+coarse footprint by a margin. **Verified directly this session (isolated
+test, independent of any checkpoint): `conv_grid(k, 1)` returns a grid with
+the exact same active voxel coordinates as the input, for every kernel size
+tried (1, 2, 3, 5, 7) — 5,326 voxels in, 5,326 voxels out, identical
+coordinates.** Per fvdb's own docstring, `conv_grid` computes the output
+structure of a same-position convolution (aggregating neighbor *features*
+into existing voxels), not a morphological dilation that adds new voxels —
+the wrong primitive for this purpose.
+
+**This invalidates the "widening didn't help" conclusion in three places**,
+not just this one:
+- TEUNet fix attempt 1 (test-time dilation, Part 1) — used the identical
+  `conv_grid` call.
+- TEUNet fix attempt 2 (retrain on a "dilated" footprint, Part 1) — same call.
+- This Stage 1 coarse-dilation retrain (`version_0`) — same call, so its
+  round-trip/confinement numbers (0.655 overall IoU, 1.9/13.2/48.2%
+  unreachable by tier) came out statistically identical to the pre-dilation
+  VAE not because widening the room doesn't help, but because no widening
+  ever occurred — `version_0` trained on the exact same footprint as the
+  original VAE, just with different random seed/epoch noise on top. None of
+  these three results should be read as evidence against the underlying idea.
+
+**Fix**: `set_from_ijk`'s `pad_min`/`pad_max` args are the real per-voxel
+dilation primitive in this codebase (already used correctly elsewhere, e.g.
+`xcube/modules/autoencoding/losses/nksr_loss.py`'s `_get_svh_samples`, and
+confirmed in fvdb's C++ source, `GridBatch.cpp`'s
+`buildPaddedGridFromCoords`). Replaced the `conv_grid` call in `decode()`
+with building a new `GridBatch` via `set_from_ijk(x.grid.ijk, pad_min=[-m]*3,
+pad_max=[m]*3, ...)` where `m = (coarse_dilation_kernel - 1) // 2`. **Verified
+this actually grows the grid**: same 5,326-voxel test sample went to 9,745
+voxels with `margin=1` (`kernel_size=3`). Smoke-tested (5 train/2 val
+batches) — clean, loss decreasing normally.
+
+**Relaunched the Stage 1 retrain with the real fix**
+(`checkpoints/gpr/VAE_stage1_corr_medium_v2_coarse_dilation/version_1`,
+started 2026-07-15 ~10:35, same config/kernel size as `version_0`, ~20hr
+expected based on the original corr_medium VAE's runtime for the same
+dataset size). `version_0` (the no-op run) is left in place for reference,
+not deleted, but should not be used for any further comparison — treat it as
+equivalent to "no dilation" going forward, not as a real data point on the
+dilation idea.
+
+## Two follow-up diagnostics before committing to the retrain (2026-07-15): margin size is too small, and coarse-level pruning is a rubber stamp
+
+Before launching the real-dilation retrain, two questions were raised about
+the fix's scope: (1) what if the missing structure sits *farther away* than
+the dilation margin reaches, and (2) what if the decoder also needs to
+*remove* wrong candidate blocks, not just gain new ones. Built two new
+diagnostics to check both empirically, using the original (non-dilated,
+already-verified) corr_medium VAE checkpoint — these are geometric/behavioral
+questions about the existing data and model, independent of whichever
+dilation fix is being tested.
+
+**`scripts/test_unreachable_distance.py`** — for every GT coarse cell found
+unreachable in the structural-confinement test, measures the (Chebyshev)
+distance to the nearest cell in Step1's own coarse footprint, bucketed against
+plausible dilation margins:
+
+| Tier | margin=1 (kernel=3, current retrain) | margin=2 (kernel=5) | margin=3 (kernel=7) | margin=5 (kernel=11) |
+|---|---|---|---|---|
+| Good | 44.9% | 61.1% | 74.0% | 90.6% |
+| Moderate | 24.7% | 41.0% | 55.1% | 76.6% |
+| Poor | **10.3%** | 22.7% | 35.3% | 54.3% |
+| Overall | 26.8% | 42.6% | 56.4% | 76.8% |
+
+**The margin the currently-running retrain uses (`coarse_dilation_kernel: 3`,
+i.e. margin=1) only reaches ~10% of poor tier's missing structure.** Even a
+much larger margin=5 (kernel=11) caps out at ~54% on poor tier — the missing
+structure there is often not a "near miss," consistent with the README's
+noted failure modes (pipe missed entirely near patch bottom, pipe cut by
+patch boundary). Good tier's misses are mostly near (90.6% reachable by
+margin=5), so the fix's value is real but tier-dependent — it should help
+good/moderate tier's residual gap far more than poor tier's.
+
+**`scripts/test_false_positive_pruning.py`** — checks whether the decoder
+actually drops coarse candidate cells from Step1's own footprint that don't
+correspond to real GT structure. **Result: literally 0/2,160,938 false-positive
+coarse cells were dropped at the coarse level, across all 999 test
+samples (100.000% survival) — verified not to be a measurement bug (`res.
+structure_grid[1]` is coordinate-for-coordinate identical to the input
+`latent.grid` for every sample checked).** Root cause is the same one already
+identified for the "add" side: Stage 1 trains by self-reconstructing GT, so
+the coarse footprint it's handed during training is always exactly correct —
+the coarsest-level `struct_conv` has literally never seen a training example
+where the right answer was "discard this candidate," so it converged to
+always keep everything.
+
+**This sounds worse than it turns out to be in practice**: a follow-up check
+(30-sample spot check, not yet the full 999) found that even though the
+coarse level formally "keeps" every false-positive candidate, only **28.6%**
+of those regions end up with any actually-occupied voxel in the *final*,
+finest-resolution output — the finer decode levels do real (if imperfect)
+cleanup downstream of the coarse rubber-stamp. So "remove wrong blocks" isn't
+fully broken, just handled later and leakily (roughly 1 in 4 false-positive
+regions survives into the final shape) rather than at the coarse gate where
+it architecturally could be cheaper/cleaner to do.
+
+## Kernel size decided (kernel=7), and why `confidence`/`radius_m` were NOT added to this retrain (2026-07-15)
+
+Chose **`coarse_dilation_kernel: 7`** (margin=3, ~35% poor-tier / ~74%
+good-tier reach per the distance table above) over margin=1 (too small,
+~10% poor-tier reach) or margin=5 (~54% poor-tier reach, but a bigger,
+less-tested jump in untrusted candidate room, closer to the regime that
+collapsed to ~0 IoU in TEUNet fix attempt 4). Config
+(`configs/gpr/gpr_vae_corr_medium_v2_coarse_dilation.yaml`) updated and
+re-smoke-tested (5 train/2 val batches) — clean, similar speed to kernel=3
+(~2.5 it/s vs. ~2.7 it/s, negligible overhead from the extra candidate cells).
+
+**Also considered, this session: should the retrain also add `confidence`
+(Step1's per-voxel prediction confidence, already extracted into the `.pkl`
+as `input_prob`) or `radius_m` (per-voxel pipe radius) as extra VAE inputs?**
+Decided **no** to both, for this retrain specifically:
+
+- **`radius_m`**: unchanged from the original decision when material
+  conditioning was added (see "Material conditioning" section above) — it
+  only describes the thickness of voxels *already known* to be pipe, and
+  carries no signal about where structure is missing or which coarse
+  candidates are false. Not relevant to either open problem (add or remove).
+- **`confidence`**: a more interesting candidate than radius, since it's
+  continuous and could plausibly signal "trust this region" / "this is a
+  shaky guess" — directly relevant to both the add and remove problems. But
+  it is **not a simple flag flip** the way material was. `use_input_intensity`
+  / `DS.INPUT_INTENSITY` already exist in the code (`xcube/modules/
+  autoencoding/base_encoder.py`, `xcube/data/gpr.py`) but are gated off
+  (`use_input_intensity: false`) and were never actually exercised even when
+  nominally on (same finding as the pre-existing material section above).
+  **The deeper problem**: ground truth has no natural "confidence" value —
+  it's simply true. Material had a natural GT-side counterpart (`target_
+  material`, a real physical attribute), so Stage 1's self-reconstruction
+  training gave the material embedding real, varying signal to learn from.
+  Confidence doesn't: feeding Stage 1 training a constant placeholder (e.g.
+  "always fully confident") for GT would train the intensity channel on a
+  value that never varies, which teaches the network nothing about it —
+  **the same "flag is wired up but never meaningfully exercised" failure
+  shape already found twice this session** (the no-op `conv_grid` dilation,
+  and the coarse-level rubber-stamp pruning). Bolting a similarly-hollow fix
+  onto this retrain would conflate two hypotheses in one ~20hr run and risk
+  a third false-negative result. **Decision: hold confidence conditioning as
+  its own, separately-designed experiment** (most likely needs to enter
+  through Stage 2's non-frozen diffusion layers directly, rather than through
+  the frozen Stage-1 encoder, which has no honest way to train on it) —
+  not attempted yet, do not conflate with the dilation retrain below.
+
+## Kernel=7 result (`version_1`, evaluated 2026-07-16): ceiling improved as predicted, but final IoU collapsed — root-caused to a class-imbalance bug, fixed
+
+`version_1` finished all 50 epochs cleanly. Evaluated with
+`scripts/test_vae_roundtrip_corr_medium_v2.py` and
+`scripts/test_vae_structural_confinement_v2.py`:
+
+| Metric | kernel=1 (original) | kernel=7 (`version_1`) |
+|---|---|---|
+| Round-trip IoU, overall | 0.664 | **0.107** |
+| Round-trip IoU, poor tier | 0.293 | **0.086** |
+| Poor-tier unreachable % (ceiling) | 48.2% | **26.7%** |
+| Recovery within reachable room | 91.5% | 84.2%-88.9% |
+
+**Two separate effects, opposite directions.** The ceiling genuinely improved
+and closely matched the distance-analysis prediction (poor tier: predicted
+~31.2% unreachable at margin=3, measured 26.7% — see table above; good/
+moderate tiers similarly tracked prediction). But round-trip IoU collapsed
+across every tier. Root cause (checked directly on one sample): the coarsest
+level's candidate pool grew from 5,326 to 21,518 cells (dilation adds ~4x more
+mostly-empty candidates), and the plain unweighted cross-entropy loss at that
+level had no way to account for the new class imbalance — the network learned
+an overly conservative "discard by default" policy, ending up keeping only
+3,248 cells, *fewer* than the 5,326 the undilated model used to correctly keep
+outright. It overcorrected from "always keep" (the old rubber-stamp behavior)
+to "mostly discard," rather than learning real judgment.
+
+**A bug was found and fixed in the confinement test script itself while
+investigating this**: `test_vae_structural_confinement_v2.py` was still
+computing "reachable" using the old broken `conv_grid` call (a leftover from
+before that bug was found and fixed in `sunet.py` itself) — so its
+"unreachable %" numbers were stale for any dilated checkpoint, and its "0
+escaped voxels" sanity check was showing 99,612 escaped voxels (a false
+alarm from comparing against the wrong, non-dilated boundary, not a real
+confinement violation). Fixed to use the same `set_from_ijk` dilation as
+`sunet.py`'s `decode()`; sanity check passes again (0 escaped) once corrected.
+**Numbers in the table above are from the corrected script.**
+
+**Fix for the collapse**: added `balance_struct_loss` (`xcube/modules/
+autoencoding/losses/base_loss.py`'s `cross_entropy()`) — per-batch
+inverse-frequency class weighting on the structure-prediction loss, gated by
+a new hparam so existing configs are unaffected. Has negligible effect where
+classes are already roughly balanced (finer, non-dilated levels) and corrects
+specifically where dilation skews the ratio (the coarsest level). Enabled in
+`configs/gpr/gpr_vae_corr_medium_v2_coarse_dilation.yaml`
+(`supervision.balance_struct_loss: true`), kernel size left at 7 (its ceiling
+improvement was real; the loss imbalance, not the margin size, was the
+diagnosed cause of the collapse). Smoke-tested (5 train/2 val batches) —
+clean.
+
 ## Current status / next steps
 
-As of 2026-07-14: v6 (material conditioning) finished, confirmed negative
-(epoch 46 read above, ~final). v7 (corrupted conditioning) at epoch 40/50,
-still running (stalled once more around epoch 12 on 2026-07-12 from the same
-known multi-worker deadlock as before, auto-resumed with no progress lost) —
-expected, per the VAE round-trip finding above, to also land in the same
-~0.66 band, since it only ever touched Stage 2. The structural confinement
-finding above is the priority now: it points at a concrete, quantified
-Stage-1-side ceiling (up to 48% of poor-tier GT structure architecturally
-unreachable) rather than an open-ended "try another Stage 2 tweak."
+As of 2026-07-16: kernel=7 with `balance_struct_loss: true` is being launched
+in the user's own terminal next (`version_2`, since `version_1` is the
+now-understood collapsed run — kept for reference, not deleted). ~20hr
+expected. v7 (corrupted conditioning, Stage 2) still finished-but-unevaluated.
 
-**Superseded by the two findings above (2026-07-13/14)**: continuing to tweak
-*how Stage 2 trains* is no longer the priority — 8/8 Stage-2-side attempts
-negative, the VAE round-trip confirms the ceiling is set before Stage 2 even
-runs, and the confinement diagnostic quantifies exactly why (up to 48% of
-poor-tier GT structure architecturally unreachable). Redirected priority,
-current order:
-1. **Stage 1 fix** (in progress) — change how the VAE's coarse-level
-   structure prediction is trained so it learns to productively use a wider,
-   less literal candidate region instead of hewing tightly to whatever
-   footprint it's hooked, since test-time-only widening already failed
-   (TEUNet fix attempts 1-2, Part 1) precisely because the decoder never
-   practiced with a wider room.
-2. Let v7 finish for completeness/documentation, but treat it as very likely
-   to also land ~flat, per the round-trip finding.
-3. If the project's goal allows it, treat the rigorous multi-attempt
+**Decision rule for when this run finishes** (unchanged in spirit from the
+last round, re-applied here): run the same two diagnostics against
+`version_2`.
+- **If round-trip IoU is at or above the original 0.664 baseline overall**,
+  with poor tier ideally moving toward the ~31% predicted unreachable-%
+  ceiling **and** recovery-within-reach back near the original ~91-96% (i.e.
+  the imbalance fix actually restored good judgment rather than just
+  changing the collapse's severity) → proceed to retrain Stage 2 diffusion
+  on top of this new VAE and run the full 999-sample evaluation.
+- **If it's still flat-or-worse than the 0.664 baseline** → this is now two
+  real attempts at the structural-fix path (no-op dilation, then a
+  genuinely-dilated-but-imbalanced version) plus one targeted repair; treat
+  further tuning here as diminishing returns, and move to properly designing
+  the confidence-conditioning idea (Stage 2 non-frozen layers, per the
+  discussion above) as the next genuinely different hypothesis.
+
+Priority order:
+1. **Let the `balance_struct_loss` retrain (`version_2`) finish**, then apply
+   the decision rule above.
+2. Consider whether the false-positive-pruning gap is worth a separate fix
+   (e.g. corrupting Stage 1's training footprint with spurious far-away
+   blocks, mirroring Stage 2's corrupted-conditioning idea) — a real,
+   now-quantified gap (28.6% net false-positive survival into the final
+   output), but lower priority than #1.
+3. Evaluate v7 (corrupted conditioning) on the full 999-sample test set for
+   completeness — expected to land ~flat per the round-trip finding, but not
+   yet measured.
+4. If the project's goal allows it, treat the rigorous multi-attempt
    elimination itself (6 TEUNet + 2 Step1 Stage-2 attempts, 2 different
-   conditioning sources, a confirmed frozen-VAE ceiling, and a quantified
-   confinement mechanism) as a defensible research outcome on its own, even
+   conditioning sources, a confirmed frozen-VAE ceiling, and two now-quantified
+   confinement mechanisms) as a defensible research outcome on its own, even
    absent a Stage 1 fix that closes the gap.
 
 **Not an option going forward**: requesting A-scan/raw-waveform access —

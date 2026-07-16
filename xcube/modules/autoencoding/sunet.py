@@ -479,7 +479,21 @@ class StructPredictionNet(nn.Module):
     
     def decode(self, res: FeaturesSet, x: fvnn.VDBTensor, is_testing=False):
         if self.coarse_dilation_kernel > 1:
-            dilated_grid = x.grid.conv_grid(self.coarse_dilation_kernel, 1)
+            # NOTE (2026-07-15): GridBatch.conv_grid(kernel_size, stride=1) does NOT
+            # grow the active voxel set -- it returns the identical footprint as the
+            # input (verified: same voxel count and coordinates for every kernel size
+            # tried). The real per-voxel dilation primitive is set_from_ijk's
+            # pad_min/pad_max (already used this way in nksr_loss.py's _get_svh_samples),
+            # which pads a box of neighbors around every active coordinate.
+            margin = (self.coarse_dilation_kernel - 1) // 2
+            dilated_grid = fvdb.GridBatch(device=x.grid.device)
+            dilated_grid.set_from_ijk(
+                x.grid.ijk,
+                pad_min=[-margin] * 3,
+                pad_max=[margin] * 3,
+                voxel_sizes=x.grid.voxel_sizes,
+                origins=x.grid.origins,
+            )
             x = fvnn.VDBTensor(dilated_grid, dilated_grid.fill_to_grid(x.feature, x.grid, 0.0))
 
         for module in self.post_kl_bottleneck:

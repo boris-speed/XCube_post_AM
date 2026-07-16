@@ -29,17 +29,36 @@ class Loss(nn.Module):
         field = torch.tanh(field / truncation_size) * truncation_size
         return field
     
-    def cross_entropy(self, pd_struct: fvnn.VDBTensor, gt_grid: fvdb.GridBatch, dynamic_grid: fvdb.GridBatch = None):
+    def cross_entropy(self, pd_struct: fvnn.VDBTensor, gt_grid: fvdb.GridBatch, dynamic_grid: fvdb.GridBatch = None,
+                       balance_classes: bool = False):
         assert torch.allclose(pd_struct.grid.origins, gt_grid.origins)
         assert torch.allclose(pd_struct.grid.voxel_sizes, gt_grid.voxel_sizes)
         idx_mask = gt_grid.ijk_to_index(pd_struct.grid.ijk).jdata == -1
         idx_mask = idx_mask.long()
+        # NOTE (2026-07-16): coarse-level dilation (coarse_dilation_kernel > 1,
+        # xcube/modules/autoencoding/sunet.py's decode()) floods the coarsest
+        # level's candidate pool with mostly-empty cells (e.g. ~4x more
+        # candidates at kernel_size=7), which this plain unweighted
+        # cross-entropy has no way to account for -- verified this collapsed
+        # kernel=7's actual output (round-trip IoU 0.66->0.11) even though the
+        # architectural ceiling improved as predicted (PROGRESS.md, 2026-07-16).
+        # Inverse-frequency class weighting counteracts that: negligible effect
+        # when classes are already roughly balanced (the un-dilated/finer
+        # levels), stronger correction exactly where dilation skews the ratio.
+        weight = None
+        if balance_classes and idx_mask.numel() > 0:
+            n_total = idx_mask.numel()
+            n_occupied = (idx_mask == 0).sum().clamp(min=1)
+            n_empty = (idx_mask == 1).sum().clamp(min=1)
+            weight = torch.tensor(
+                [n_total / (2.0 * n_occupied), n_total / (2.0 * n_empty)],
+                device=idx_mask.device, dtype=pd_struct.feature.jdata.dtype)
         if dynamic_grid is not None:
             dynamic_mask = dynamic_grid.ijk_to_index(pd_struct.grid.ijk).jdata == -1
-            loss = F.cross_entropy(pd_struct.feature.jdata, idx_mask, reduction='none') * dynamic_mask.float()
+            loss = F.cross_entropy(pd_struct.feature.jdata, idx_mask, weight=weight, reduction='none') * dynamic_mask.float()
             loss = loss.mean()
         else:
-            loss = F.cross_entropy(pd_struct.feature.jdata, idx_mask)
+            loss = F.cross_entropy(pd_struct.feature.jdata, idx_mask, weight=weight)
         return 0.0 if idx_mask.size(0) == 0 else loss
     
     def struct_acc(self, pd_struct: fvnn.VDBTensor, gt_grid: fvdb.GridBatch):
@@ -167,7 +186,9 @@ class Loss(nn.Module):
                     else:
                         gt_grid_i = gt_grid
                         dyn_grid_i = dynamic_grid
-                    loss_dict.add_loss(f"struct-{feat_depth}", self.cross_entropy(pd_struct_i, gt_grid_i, dyn_grid_i),
+                    loss_dict.add_loss(f"struct-{feat_depth}", self.cross_entropy(
+                                        pd_struct_i, gt_grid_i, dyn_grid_i,
+                                        balance_classes=self.hparams.supervision.get('balance_struct_loss', False)),
                                     self.hparams.supervision.structure_weight)
                     if compute_metric:
                         with torch.no_grad():
@@ -179,12 +200,14 @@ class Loss(nn.Module):
                     gt_grid_i = gt_tree[feat_depth]
                     # get dynamic grid
                     dyn_grid_i = dynamic_grid.coarsened_grid(2 ** feat_depth) if dynamic_grid is not None else None
-                    loss_dict.add_loss(f"struct-{feat_depth}", self.cross_entropy(pd_struct_i, gt_grid_i, dyn_grid_i),
+                    loss_dict.add_loss(f"struct-{feat_depth}", self.cross_entropy(
+                                        pd_struct_i, gt_grid_i, dyn_grid_i,
+                                        balance_classes=self.hparams.supervision.get('balance_struct_loss', False)),
                                     self.hparams.supervision.structure_weight)
                     if compute_metric:
                         with torch.no_grad():
                             metric_dict.add_loss(f"struct-acc-{feat_depth}", self.struct_acc(pd_struct_i, gt_grid_i))
-        
+
         # compute normal loss
         if self.hparams.with_normal_branch:
             if out['normal_features'] == {}:
